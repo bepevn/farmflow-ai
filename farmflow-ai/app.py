@@ -312,6 +312,8 @@ def get_conn():
         conn.execute("ALTER TABLE users ADD COLUMN nickname TEXT")
     if "avatar" not in existing_cols:
         conn.execute("ALTER TABLE users ADD COLUMN avatar TEXT")
+    if "remember_token" not in existing_cols:
+        conn.execute("ALTER TABLE users ADD COLUMN remember_token TEXT")
     conn.commit()
     return conn
 
@@ -389,6 +391,33 @@ def authenticate(username: str, password: str):
     if check_hash == stored_hash:
         return {"id": user_id, "username": username, "role": role}
     return None
+
+
+def issue_remember_token(user_id: int) -> str:
+    """새로고침해도 로그인이 유지되도록, 브라우저 주소창(쿼리 파라미터)에
+    저장해둘 토큰을 하나 발급해서 DB에 같이 저장해둔다."""
+    token = secrets.token_hex(16)
+    conn = get_conn()
+    conn.execute("UPDATE users SET remember_token=? WHERE id=?", (token, user_id))
+    conn.commit()
+    return token
+
+
+def get_user_by_remember_token(user_id: int, token: str):
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT id, username, role FROM users WHERE id=? AND remember_token=? AND remember_token IS NOT NULL",
+        (user_id, token),
+    ).fetchone()
+    if not row:
+        return None
+    return {"id": row[0], "username": row[1], "role": row[2]}
+
+
+def clear_remember_token(user_id: int):
+    conn = get_conn()
+    conn.execute("UPDATE users SET remember_token=NULL WHERE id=?", (user_id,))
+    conn.commit()
 
 
 def add_listing(user_id, listing_type, title, region, area_pyeong, crop,
@@ -567,6 +596,15 @@ if "selected_conversation" not in st.session_state:
 if "requested_nav" not in st.session_state:
     st.session_state.requested_nav = None
 
+# 새로고침해도 로그인이 풀리지 않도록, 주소창에 저장된 토큰으로 자동 로그인 시도
+if st.session_state.user is None:
+    _qp_uid = st.query_params.get("uid")
+    _qp_tok = st.query_params.get("tok")
+    if _qp_uid and _qp_tok:
+        _restored_user = get_user_by_remember_token(int(_qp_uid), _qp_tok)
+        if _restored_user:
+            st.session_state.user = _restored_user
+
 
 # ------------------------------------------------------------------
 # 사이드바 (로그인 / 회원가입)
@@ -613,43 +651,15 @@ def render_sidebar():
                 )
 
             with tab_profile:
-                uploaded = st.file_uploader(
-                    "프로필 사진 변경", type=["png", "jpg", "jpeg"], key="avatar_uploader"
-                )
-                if uploaded is not None:
-                    b64 = base64.b64encode(uploaded.read()).decode()
-                    update_avatar(st.session_state.user["id"], b64)
-                    st.success("프로필 사진이 변경되었습니다.")
+                st.write("프로필 사진, 닉네임, 아이디 변경은 **👤 마이페이지**에서 할 수 있어요.")
+                if st.button("마이페이지로 이동", use_container_width=True):
+                    st.session_state.requested_nav = "👤 마이페이지"
                     st.rerun()
 
-                with st.form("nickname_form"):
-                    new_nickname = st.text_input("닉네임", value=display_name)
-                    nick_submitted = st.form_submit_button("닉네임 저장", use_container_width=True)
-                if nick_submitted:
-                    if new_nickname.strip():
-                        update_nickname(st.session_state.user["id"], new_nickname.strip())
-                        st.success("닉네임이 변경되었습니다.")
-                        st.rerun()
-                    else:
-                        st.error("닉네임을 입력해주세요.")
-
-                with st.form("username_form"):
-                    new_username = st.text_input("아이디", value=st.session_state.user["username"])
-                    id_submitted = st.form_submit_button("아이디 변경", use_container_width=True)
-                if id_submitted:
-                    if not new_username.strip():
-                        st.error("아이디를 입력해주세요.")
-                    else:
-                        ok, msg = update_username(st.session_state.user["id"], new_username.strip())
-                        if ok:
-                            st.session_state.user["username"] = new_username.strip()
-                            st.success(msg)
-                            st.rerun()
-                        else:
-                            st.error(msg)
-
             if st.button("로그아웃", use_container_width=True):
+                clear_remember_token(st.session_state.user["id"])
                 st.session_state.user = None
+                st.query_params.clear()
                 st.rerun()
     else:
         tab_login, tab_signup = st.sidebar.tabs(["로그인", "회원가입"])
@@ -663,6 +673,9 @@ def render_sidebar():
                 user = authenticate(u, p)
                 if user:
                     st.session_state.user = user
+                    token = issue_remember_token(user["id"])
+                    st.query_params["uid"] = str(user["id"])
+                    st.query_params["tok"] = token
                     st.rerun()
                 else:
                     st.error("아이디 또는 비밀번호가 올바르지 않습니다.")
@@ -684,6 +697,9 @@ def render_sidebar():
                     if ok:
                         # 회원가입 성공 시 바로 로그인 상태로 전환
                         st.session_state.user = {"id": new_id, "username": su, "role": role}
+                        token = issue_remember_token(new_id)
+                        st.query_params["uid"] = str(new_id)
+                        st.query_params["tok"] = token
                         st.rerun()
                     else:
                         st.error(msg)
